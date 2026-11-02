@@ -40,3 +40,5 @@ embodiment_tag_to_projector_index:
   sim_behavior_r1_pro: 31
   mecka_hands: 27
   real_r1_pro_sharpa: 28
+  unitree_g1_sonic: 33
+  unitree_g1_amo: 34

@@ -61,6 +61,15 @@ action_head_cfg:
       _convert_: object
       diffusion_model_pretrained_path: ${dit_version}
       model_type: "i2v"
+      # CausalWanModel's own defaults are action_dim=32 / max_state_dim=64, and nothing
+      # used to feed max_action_dim / max_state_dim through to it -- so the action encoder
+      # and decoder were built 32-wide no matter what the data config said. Fine while every
+      # embodiment fit in 32 dims (droid 8, yam 14, agibot 22); with Unitree G1 SONIC's 78-D
+      # action it is `RuntimeError: Expected size for first two dimensions of batch2 tensor
+      # to be: [1, 78] but got: [1, 32]` at the first training step. Wiring them here is a
+      # no-op for the existing embodiments (both defaults are unchanged).
+      action_dim: ${max_action_dim}
+      max_state_dim: ${max_state_dim}
       frame_seqlen: ${frame_seqlen}
       dim: 5120
       in_dim: 36

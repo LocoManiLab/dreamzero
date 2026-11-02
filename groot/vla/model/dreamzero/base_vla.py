@@ -336,38 +336,40 @@ class VLA(PreTrainedModel):
 
     @classmethod
     def load_lora(
-        cls, 
-        pretrained_model_name_or_path: str
-    ): 
+        cls,
+        pretrained_model_name_or_path: str,
+        pretrained_base_path: str | None = None,
+    ):
         from safetensors.torch import load_file
         import os
         import json
+        import gc
         print("loading lora@@@@@")
 
         # Check for different checkpoint formats
         safetensors_path = os.path.join(pretrained_model_name_or_path, "model.safetensors")
         safetensors_index_path = os.path.join(pretrained_model_name_or_path, "model.safetensors.index.json")
-        
+
         state_dict = {}
         if os.path.exists(safetensors_index_path):
             # Handle sharded safetensors
             print(f"Loading sharded safetensors using index: {safetensors_index_path}")
-            
+
             with open(safetensors_index_path, 'r') as f:
                 index = json.load(f)
-            
+
             # Load each shard
             for shard_file in set(index["weight_map"].values()):
                 shard_path = os.path.join(pretrained_model_name_or_path, shard_file)
                 print(f"Loading shard: {shard_path}")
                 shard_state_dict = load_file(shard_path)
                 state_dict.update(shard_state_dict)
-                
+
         elif os.path.exists(safetensors_path):
             # Handle single safetensors file
             print(f"Loading weights from safetensors: {safetensors_path}")
             state_dict.update(load_file(safetensors_path))
-        
+
         # Load config
         print("loading config@@")
         config_path = os.path.join(pretrained_model_name_or_path, "config.json")
@@ -388,8 +390,142 @@ class VLA(PreTrainedModel):
             inner['skip_component_loading'] = False
             print("skip_component_loading disabled for load_lora")
 
-        # Instantiate model (LoRA layers now exist from init)
+        # Instantiate model (LoRA layers now exist from init).
+        # At this point the DiT trunk has raw Wan2.1 weights (from dit_version).
         model = cls(config)
+
+        # --- Load pretrained base (e.g. DreamZero-AgiBot) BEFORE LoRA ---
+        # During training the LoRA adapter was learned on top of this base,
+        # so we must restore it before applying the LoRA delta. Without this
+        # step the LoRA operates on raw Wan2.1 weights and the AgiBot
+        # pretraining is lost.
+        #
+        # Because defer_lora_injection is forced False above, the model
+        # already has peft wrappers: original keys like
+        #   action_head.model.blocks.0.self_attn.q.weight
+        # become
+        #   action_head.model.base_model.model.blocks.0.self_attn.q.weight
+        # We must remap the pretrained base keys to match.
+        if pretrained_base_path is not None:
+            print(f"Loading pretrained base from: {pretrained_base_path}")
+            base_index = os.path.join(pretrained_base_path, "model.safetensors.index.json")
+            base_single = os.path.join(pretrained_base_path, "model.safetensors")
+            model_sd = model.state_dict()
+
+            # Detect peft prefix by finding "base_model.model." in model keys.
+            # e.g. model has "action_head.model.base_model.model.blocks.0..."
+            #      base has  "action_head.model.blocks.0..."
+            # We need to replace "action_head.model." with
+            #                    "action_head.model.base_model.model."
+            peft_prefix_insert = ""
+            plain_prefix = ""
+            for mk in model_sd:
+                idx_bm = mk.find(".base_model.model.")
+                if idx_bm >= 0:
+                    prefix_before = mk[:idx_bm]
+                    peft_prefix_insert = f"{prefix_before}.base_model.model."
+                    plain_prefix = f"{prefix_before}."
+                    print(f"  detected peft prefix: '{plain_prefix}' → '{peft_prefix_insert}'")
+                    break
+
+            def _remap_base_key(key):
+                """Remap a pretrained base key to match the peft-wrapped model."""
+                if not peft_prefix_insert or not key.startswith(plain_prefix):
+                    return key
+                return peft_prefix_insert + key[len(plain_prefix):]
+
+            def _remap_and_filter(shard_sd, model_sd):
+                """Remap pretrained base keys to peft naming, then drop shape mismatches."""
+                filtered = {}
+                skipped_shape = []
+                skipped_missing = []
+                loaded = 0
+                for k, v in shard_sd.items():
+                    rk = _remap_base_key(k)
+                    if rk not in model_sd:
+                        skipped_missing.append(k)
+                        continue
+                    if tuple(v.shape) != tuple(model_sd[rk].shape):
+                        skipped_shape.append((k, rk, tuple(v.shape), tuple(model_sd[rk].shape)))
+                        continue
+                    filtered[rk] = v
+                    loaded += 1
+                if skipped_shape:
+                    print(f"  skipped {len(skipped_shape)} shape-mismatched keys:")
+                    for orig, rk, src, dst in skipped_shape[:8]:
+                        print(f"    {orig} -> {rk}: base {src} vs model {dst}")
+                if skipped_missing:
+                    print(f"  skipped {len(skipped_missing)} keys not in model (non-DiT or removed)")
+                print(f"  mapped {loaded} keys to peft naming")
+                return filtered
+
+            # Track cumulative applied-key count across all shards. A silent
+            # zero-load (peft prefix mismatch, renamed ckpt, etc.) would leave
+            # the DiT trunk on raw Wan2.1 and the LoRA delta would be applied
+            # to the wrong base — exactly what this branch exists to prevent.
+            total_applied = 0
+            unfilled_dit_keys: set[str] = set()
+            if peft_prefix_insert:
+                unfilled_dit_keys = {k for k in model_sd if k.startswith(peft_prefix_insert)}
+
+            def _apply_shard(shard_sd):
+                nonlocal total_applied, unfilled_dit_keys
+                applied_keys = set(shard_sd.keys())
+                missing, unexpected = model.load_state_dict(shard_sd, strict=False)
+                # `missing` is keys present in the model but not in shard_sd —
+                # not a problem for partial shards. `unexpected` is keys in
+                # shard_sd that don't exist in the model — should be empty
+                # because _remap_and_filter already dropped those.
+                assert not unexpected, (
+                    f"unexpected keys after remap+filter (should be impossible): "
+                    f"{list(unexpected)[:8]}..."
+                )
+                total_applied += len(applied_keys)
+                unfilled_dit_keys -= applied_keys
+
+            if os.path.exists(base_index):
+                with open(base_index, 'r') as f:
+                    idx = json.load(f)
+                for shard_file in sorted(set(idx["weight_map"].values())):
+                    shard_path = os.path.join(pretrained_base_path, shard_file)
+                    print(f"  base shard: {shard_path}")
+                    shard_sd = load_file(shard_path)
+                    shard_sd = _remap_and_filter(shard_sd, model_sd)
+                    _apply_shard(shard_sd)
+                    del shard_sd
+                    gc.collect()
+            elif os.path.exists(base_single):
+                base_sd = load_file(base_single)
+                base_sd = _remap_and_filter(base_sd, model_sd)
+                _apply_shard(base_sd)
+                del base_sd
+            else:
+                print(f"WARNING: pretrained_base_path={pretrained_base_path} has no weights, skipping")
+            del model_sd
+            gc.collect()
+
+            # Guard against the silent zero-load failure mode: if the peft
+            # prefix detection no-ops or the ckpt has been renamed, _remap
+            # silently produces an empty dict and load_state_dict reports
+            # nothing. A real DiT load is hundreds of keys.
+            assert total_applied >= 100, (
+                f"Pretrained base load applied only {total_applied} keys — "
+                f"expected hundreds. The peft prefix remap likely failed "
+                f"(detected '{plain_prefix}' -> '{peft_prefix_insert}'). "
+                f"Refusing to proceed; LoRA would be applied to raw Wan2.1 weights."
+            )
+            if unfilled_dit_keys:
+                # DiT keys that the pretrained base did NOT overwrite stay at
+                # their raw Wan2.1 init. This is fine for a few task-specific
+                # heads (action_proj, state_encoder) shape-skipped above, but
+                # a large count means the AgiBot ckpt is incomplete vs the
+                # current model arch.
+                print(
+                    f"WARNING: {len(unfilled_dit_keys)} DiT keys were NOT "
+                    f"overwritten by the pretrained base; they remain at the "
+                    f"Wan2.1 init. First 8: {sorted(unfilled_dit_keys)[:8]}"
+                )
+            print(f"Pretrained base loaded: {total_applied} keys applied")
 
         # Remove .base_layer from keys if present
         has_base_layer = any(".base_layer." in key for key in state_dict.keys())
@@ -397,14 +533,14 @@ class VLA(PreTrainedModel):
             print("Removing '.base_layer' from state dict keys")
             state_dict = {k.replace(".base_layer.", "."): v for k, v in state_dict.items()}
 
-        # Load weights
+        # Load LoRA weights on top of the pretrained base
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-            
+
         if missing_keys:
             print(f"Missing keys when loading pretrained weights: {missing_keys}")
         if unexpected_keys:
             print(f"Unexpected keys when loading pretrained weights: {unexpected_keys}")
-        
+
         print("Successfully loaded pretrained weights")
 
         print(f"{cls}\n")

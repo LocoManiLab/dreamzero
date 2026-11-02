@@ -1,0 +1,85 @@
+# @package _global_
+# Unitree G1 + SONIC data config for the Wan2.1-I2V-14B backbone (soma / uni-loco-manip).
+#
+# ABSOLUTE actions, not relative -- despite the `_relative` filename kept for symmetry with
+# the upstream configs. SONIC's 64-D `motion_token` is a LATENT whole-body command decoded by
+# the SONIC controller, not a joint target, so there is no `state.motion_token` to difference
+# against; and the two hand action groups (`left_hand_joints` / `right_hand_joints`) are named
+# differently from their state counterparts (`left_hand` / `right_hand`), which is the other
+# thing `relative_action_keys` requires. Setting relative_action: true here would silently
+# produce an EMPTY relative-key list and change nothing except the stats file it looks for.
+#
+# max_action_dim must be >= 78 (motion_token 64 + hands 7+7); the shared default in
+# model/dreamzero/transform/dreamzero_cotrain.yaml is 32, which would truncate the action to
+# its first 32 dims WITHOUT an error. Overridden here so the data config alone is enough.
+
+defaults:
+  - dreamzero/base_48_wan_fine_aug_relative
+  - _self_ # this file will override the base
+
+# Pinned here rather than left to the caller. The base config defaults to 480x256, and the
+# whole 14B setup is sized for 176x320: the Wan2.1 VAE downscales 8x and the DiT patch
+# embedding another 2x, so frame_seqlen must be (176/8/2)*(320/8/2) = 220. Inheriting
+# 480x256 instead gives (256/8/2)*(480/8/2) = 480 tokens per frame against a model built
+# for 220 -- and it does NOT fail at load time, it fails at the first step with the
+# misleading "Sequence length does not match block layout. For 5B use 320x176 ...".
+# The upstream 14B scripts pass these two on the command line; keeping them in the data
+# config means the config alone is self-consistent, whoever launches it.
+image_resolution_height: 176
+image_resolution_width: 320
+
+max_state_dim: 64            # G1 proprio is 43-D; padded to 64 by DreamTransform
+max_action_dim: 78           # motion_token 64 + left_hand 7 + right_hand 7
+use_global_metadata: false
+relative_action: false
+relative_action_per_horizon: false
+relative_action_keys: []
+max_chunk_size: 5
+# How many RAW frames one sampled step spans (see lerobot_sharded.py chunk_stride).
+# 1 = upstream: 24 consecutive frames per action chunk, 8 video frames at stride 3 over
+# them. Those constants are a cadence in SECONDS at DROID's 15 Hz (1.60 s of action,
+# 6.40 s of video); on 50 Hz SONIC data they collapse to 0.48 s / 1.92 s. stride 3
+# restores 1.44 s / 4.32 s at an unchanged token count.
+# ⚠️ The policy then predicts at fps/stride, so deploy must upsample by the same factor
+# (deployment/run_dreamzero_server.py --upsample-factor).
+chunk_stride: 1
+# Use 10% of data in shards before moving to next shard
+dataset_shard_sampling_rate: 0.1
+mixture_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotMixtureDataset.from_mixture_spec
+single_dataset_cls: groot.vla.data.dataset.lerobot_sharded.ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+
+# Set via CLI: unitree_g1_sonic_data_root=/path/to/gear-converted/dataset
+unitree_g1_sonic_data_root: ???
+
+train_dataset:
+  _target_: ${mixture_dataset_cls}
+  _convert_: object
+  mixture_spec:
+    - dataset_path:
+        unitree_g1_sonic:
+          - ${unitree_g1_sonic_data_root}
+      dataset_weight: 1.0
+      distribute_weights: true
+
+  dataset_class: ${single_dataset_cls}
+  all_modality_configs: ${modality_configs}
+  all_transforms: ${transforms}
+  metadata_versions: ${metadata_versions}
+  fps: ${fps}
+  dataset_kwargs:
+    chunk_stride: ${chunk_stride}
+    # Single source of truth with the model: the dataset must emit exactly as many actions
+    # per chunk as the DiT's action register holds, or the model reads a register layout it
+    # was never trained on -- silently, because the shapes still agree.
+    action_chunk_len: ${num_action_per_block}
+    video_backend: decord
+    use_global_metadata: ${use_global_metadata}
+    max_chunk_size: ${max_chunk_size}
+    relative_action: ${relative_action}
+    relative_action_keys: ${relative_action_keys}
+    relative_action_per_horizon: ${relative_action_per_horizon}
+  mixture_kwargs:
+    training: true
+    balance_dataset_weights: false
+    seed: 42
+    shard_sampling_rate: ${dataset_shard_sampling_rate}

@@ -235,6 +235,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         skip_img_transform: bool = False,
         lazy_load: bool = False,
         device_mesh: DeviceMesh | None = None,
+        pretrained_base_path: str | None = None,
     ):
         """
         Initialize the GrootSimPolicy.
@@ -245,7 +246,21 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             device (int | str): Device to run the model on.
             lazy_load (bool): If True, don't load model to GPU immediately.
             device_mesh (DeviceMesh | None): Device mesh to parallelize the model across.
+            pretrained_base_path (str | None): the pretrained base checkpoint (e.g.
+                DreamZero-AgiBot) the LoRA adapter was trained ON TOP OF. REQUIRED for
+                correct inference whenever save_lora_only=True and training started from a
+                base other than the raw Wan backbone.
+
+                Without it `load_lora` rebuilds the DiT trunk from `dit_version` -- raw
+                Wan2.1 -- and lays the LoRA delta on those weights instead. Nothing errors:
+                the action head, which learned to read DreamZero's video features, is handed
+                raw-Wan features it has never seen, so it falls back to emitting the action
+                PRIOR. Measured on a G1 SONIC checkpoint served this way: predictions were
+                uncorrelated with the demonstrations (median corr ~0.02 over 64 dims) even
+                though the action loss had fallen 90% in training, and replacing the camera
+                image with pure black moved the output by only 14% of the real action range.
         """
+        self._pretrained_base_path = pretrained_base_path
         super().__init__(embodiment_tag=embodiment_tag, model_path=model_path, device=device)
         model_dir = Path(model_path)
         self.rank = dist.get_rank()
@@ -299,7 +314,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             # Instantiate the model
             if hasattr(train_cfg, "save_lora_only") and train_cfg.save_lora_only is True:
                 print(f"Loading LoRA weights from pretrained")
-                model = model_class.load_lora(model_path)
+                model = model_class.load_lora(model_path, pretrained_base_path=self._pretrained_base_path)
             else:
                 print(f"Loading model from pretrained directly")
                 model = model_class.from_pretrained(model_path, config=model_config)
@@ -312,7 +327,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
             if hasattr(train_cfg, "save_lora_only") and train_cfg.save_lora_only is True:
                 print(f"Loading LoRA weights from pretrained")
                 cls = getattr(importlib.import_module(cls_module), cls_name)
-                model = cls.load_lora(model_path)
+                model = cls.load_lora(model_path, pretrained_base_path=self._pretrained_base_path)
             else:
                 print(f"Loading model from pretrained directly")
                 cls = getattr(importlib.import_module(cls_module), cls_name)

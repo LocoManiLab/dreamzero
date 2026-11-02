@@ -65,6 +65,8 @@ VALID_EMBODIMENT_TAGS = [
     "dream", "yam", "xdof",
     "gr1_unified_segmentation", "language_table_sim", "gr1_isaac",
     "sim_behavior_r1_pro", "mecka_hands", "real_r1_pro_sharpa",
+    "unitree_g1_sonic",
+    "unitree_g1_amo",
 ]
 
 
@@ -441,6 +443,30 @@ def main():
     parser.add_argument("--fps", type=float, default=None, help="Override FPS (default: use dataset FPS from info.json)")
     parser.add_argument("--action-horizon", type=int, default=24, help="Action horizon for relative stats (default: 24)")
     parser.add_argument("--force", action="store_true", help="Overwrite existing GEAR metadata files")
+    parser.add_argument(
+        "--keep-modality", action="store_true",
+        help="Do NOT rebuild meta/modality.json -- read the existing one and use it. For datasets "
+             "that already ship a hand-written modality.json (e.g. the GR00T-format ones soma "
+             "collects), where the auto-detection below would be WRONG: it derives action keys "
+             "from columns named `action`/`action.*` only, so a layout that also draws on other "
+             "column families (Unitree G1 SONIC packs `teleop.left_hand_joints` and "
+             "`teleop.right_hand_joints` into its 78-D action) silently loses those dimensions."
+    )
+    parser.add_argument(
+        "--keep-tasks", action="store_true",
+        help="Do NOT rebuild meta/tasks.jsonl and meta/episodes.jsonl -- keep the ones the "
+             "dataset already ships. Required for GR00T-style datasets, where the annotation "
+             "column stores a task INDEX rather than the text: build_tasks() str()s the "
+             "column, so every task becomes its own index (\"0\") and the policy is trained "
+             "and served the literal string \"0\" as its instruction. Nothing errors."
+    )
+    parser.add_argument(
+        "--stats-columns", type=str, nargs="*", default=None,
+        help="Explicit parquet columns to compute stats.json over. Defaults to the state/action "
+             "columns auto-detected from info.json, or -- with --keep-modality -- to every "
+             "`original_key` the existing modality.json references for state and action. Training "
+             "looks stats up BY ORIGINAL KEY, so a column missing here is a KeyError at step 0."
+    )
 
     args = parser.parse_args()
 
@@ -509,11 +535,24 @@ def main():
             task_key = detected["annotation"][0]
         log.info("  Auto-detected task key: %s", task_key)
 
-    # 2. Build modality.json
-    modality = build_modality_json(info, detected, state_mapping, action_mapping, task_key)
-
+    # 2. Build modality.json (or keep the one the dataset already ships)
     modality_path = meta_dir / "modality.json"
-    if modality_path.exists() and not args.force:
+    if args.keep_modality:
+        if not modality_path.exists():
+            log.error("--keep-modality given but %s does not exist", modality_path)
+            sys.exit(1)
+        with open(modality_path) as f:
+            modality = json.load(f)
+        for section in ("state", "action", "video", "annotation"):
+            modality.setdefault(section, {})
+        log.info("  Keeping existing modality.json (%d state, %d action, %d video keys)",
+                 len(modality["state"]), len(modality["action"]), len(modality["video"]))
+    else:
+        modality = build_modality_json(info, detected, state_mapping, action_mapping, task_key)
+
+    if args.keep_modality:
+        pass
+    elif modality_path.exists() and not args.force:
         log.info("  modality.json already exists, skipping (use --force to overwrite)")
     else:
         with open(modality_path, "w") as f:
@@ -540,9 +579,24 @@ def main():
 
     # 5. Compute stats.json
     stats_path = meta_dir / "stats.json"
-    numeric_cols = detected["state"] + detected["action"]
-    if "timestamp" in info.get("features", {}):
+    if args.stats_columns:
+        numeric_cols = list(args.stats_columns)
+    elif args.keep_modality:
+        # Every column the kept modality.json actually reads. `get_dataset_metadata` in
+        # groot/vla/data/dataset/lerobot.py indexes le_statistics[original_key], so this
+        # list has to cover the union of state+action original keys -- not just the ones
+        # whose names happen to start with "observation.state" / "action".
+        numeric_cols = []
+        for section in ("state", "action"):
+            for meta in modality.get(section, {}).values():
+                key = meta.get("original_key")
+                if key and key not in numeric_cols:
+                    numeric_cols.append(key)
+    else:
+        numeric_cols = detected["state"] + detected["action"]
+    if "timestamp" in info.get("features", {}) and "timestamp" not in numeric_cols:
         numeric_cols.append("timestamp")
+    log.info("  Stats columns: %s", numeric_cols)
 
     if stats_path.exists() and not args.force:
         log.info("  stats.json already exists, skipping")
@@ -575,7 +629,9 @@ def main():
 
     # 7. Build tasks.jsonl
     tasks_path = meta_dir / "tasks.jsonl"
-    if tasks_path.exists() and not args.force:
+    if args.keep_tasks and tasks_path.exists():
+        log.info("  Keeping existing tasks.jsonl")
+    elif tasks_path.exists() and not args.force:
         log.info("  tasks.jsonl already exists, skipping")
     else:
         tasks = build_tasks(parquet_paths, task_key)
@@ -586,7 +642,9 @@ def main():
 
     # 8. Build episodes.jsonl
     episodes_path = meta_dir / "episodes.jsonl"
-    if episodes_path.exists() and not args.force:
+    if args.keep_tasks and episodes_path.exists():
+        log.info("  Keeping existing episodes.jsonl")
+    elif episodes_path.exists() and not args.force:
         log.info("  episodes.jsonl already exists, skipping")
     else:
         tasks = []

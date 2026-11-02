@@ -346,3 +346,36 @@ class EmbodimentTag(Enum):
     """
     The Mecka robot with hands.
     """
+
+    UNITREE_G1_AMO = "unitree_g1_amo"
+    """
+    Unitree G1 driven by the AMO whole-body controller (soma / uni-loco-manip).
+
+    One ego camera, 32-D proprio, and a 36-D EXPLICIT action: arms 7+7, torso rpy 3,
+    height 1, a 4-D locomotion command (torso_vx, torso_vy, torso_vyaw, target_yaw) and
+    the two 7-DOF hand vectors. Same 36-D shape as the published DreamZero G1 setting and
+    as SIMPLE's DreamZero G1 baseline, which is joint targets plus a locomotion command.
+
+    Contrast with UNITREE_G1_SONIC, whose action is a 64-D LATENT motion_token: trained on
+    that, the action denoising loss fell 90% while open-loop predictions stayed
+    uncorrelated with the demonstrations (median corr ~0.02 over 64 dims) and replacing the
+    camera image with pure black moved the output by 0.03 against a real action range of
+    0.16 -- the model learned the action prior and ignored the observation. A latent teleop
+    token has high conditional entropy: the same frame maps to different tokens depending
+    on operator intent. Explicit joint and velocity targets do not.
+
+    Blob schema: meta/modality.json leaves `original_key` null for the groups packed into
+    `observation.state` (32) and `action` (22); the index ranges identify them
+    unambiguously and soma's convert fills them in.
+    """
+
+    UNITREE_G1_SONIC = "unitree_g1_sonic"
+    """
+    Unitree G1 driven by the SONIC whole-body controller (soma / uni-loco-manip).
+
+    One ego camera (`ego_view`), 43-D proprio (left_leg 6, right_leg 6, waist 3,
+    left_arm 7, left_hand 7, right_arm 7, right_hand 7) and a 78-D action built from
+    SONIC's 64-D latent `motion_token` plus the two 7-DOF Dex3 hand joint vectors.
+    Distinct from the UNITREE_G1_FULL_BODY* tags above: those carry joint-space or
+    nav-command actions, this one carries a latent motion token that only SONIC decodes.
+    """

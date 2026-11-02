@@ -1,3 +1,37 @@
+## LocoManiLab modifications
+
+This repository is a modified fork of [dreamzero0/dreamzero](https://github.com/dreamzero0/dreamzero), based on upstream commit [`ab790c1`](https://github.com/dreamzero0/dreamzero/commit/ab790c198fbce33503358efbbd4187ce9a89adf3). It was modified by Gamma Robotics for the [LocoManiLab](https://github.com/Gamma-Robot/LocoManiLab) humanoid loco-manipulation benchmark, which uses it as a git submodule. Everything below this section is the upstream README, unchanged.
+
+Summary of changes:
+
+- Register the Unitree G1 SONIC and AMO embodiments (`groot/vla/data/schema/embodiment_tags.py`) with data configs for the Wan2.1-I2V-14B and Wan2.2-TI2V-5B backbones; new embodiment tags no longer break loading of older checkpoints.
+- `deployment/run_dreamzero_server.py`: a policy server speaking the Isaac-GR00T ZMQ `get_action` protocol, so the LocoManiLab simulator/robot client can drive DreamZero.
+- Training fixes: drive the chunk sampler from `num_action_per_block` with aligned bounds, mark the VAE encoder/decoder as DeepSpeed ZeRO-3 leaf modules, and let a released checkpoint adapt to an embodiment with a wider action space.
+- Serving fix: restore the LoRA's pretrained base so the fine-tuned weights are actually used.
+- `scripts/data/convert_lerobot_to_gear.py`: G1 embodiment choices plus `--keep-modality`, `--keep-tasks` and `--stats-columns` for GR00T-format LeRobot datasets.
+
+Files modified or added relative to the upstream base commit:
+
+- `README.md` (modified: this section)
+- `deployment/run_dreamzero_server.py` (added)
+- `groot/vla/configs/data/dreamzero/base_48_wan_fine_aug_relative.yaml` (modified)
+- `groot/vla/configs/data/dreamzero/unitree_g1_amo_relative.yaml` (added)
+- `groot/vla/configs/data/dreamzero/unitree_g1_sonic_relative.yaml` (added)
+- `groot/vla/configs/data/dreamzero/unitree_g1_sonic_relative_wan22.yaml` (added)
+- `groot/vla/configs/model/dreamzero/action_head/wan_flow_matching_action_tf.yaml` (modified)
+- `groot/vla/configs/model/dreamzero/transform/base.yaml` (modified)
+- `groot/vla/data/dataset/lerobot_sharded.py` (modified)
+- `groot/vla/data/schema/embodiment_tags.py` (modified)
+- `groot/vla/experiment/base.py` (modified)
+- `groot/vla/model/dreamzero/base_vla.py` (modified)
+- `groot/vla/model/dreamzero/transform/dreamzero_cotrain.py` (modified)
+- `groot/vla/model/n1_5/sim_policy.py` (modified)
+- `scripts/data/convert_lerobot_to_gear.py` (modified)
+
+The upstream [LICENSE](LICENSE) (Apache License 2.0) is retained unchanged and also applies to these modifications. This section is the notice of modified files required by Section 4(b) of that license.
+
+---
+
 # NVIDIA DreamZero: World Action Models Are Zero-Shot Policies
 A research project from [NVIDIA GEAR Lab](https://research.nvidia.com/labs/gear/).
 

@@ -709,6 +709,41 @@ class BaseExperiment(ABC):
             safetensors_index_path = os.path.join(ckpt_dir, "model.safetensors.index.json")
             safetensors_path = os.path.join(ckpt_dir, "model.safetensors")
 
+            def _drop_shape_mismatches(state_dict, model, where):
+                """Drop entries whose shape differs from the model's, and say which.
+
+                `strict=False` only forgives MISSING and UNEXPECTED keys -- a shape mismatch
+                is collected into `error_msgs` and raised no matter what strict is set to.
+                That makes the pretrained path unusable for the one case it exists for:
+                adapting a released checkpoint to a NEW EMBODIMENT whose action vector is a
+                different width. `action_encoder.W1` and `action_decoder.layer2` are sized by
+                action_dim (DreamZero-AgiBot 32, Unitree G1 SONIC 78), so loading the former
+                into the latter dies with `size mismatch for ...` before step 0.
+
+                Those two modules are exactly the ones a new embodiment has to relearn --
+                dimension k of a 32-D AgiBot action and dimension k of a 78-D SONIC action
+                are unrelated quantities, so there is nothing to transfer even in the
+                overlapping 32 dims. Everything else (the DiT blocks, the video path, the
+                state encoder when max_state_dim matches) transfers unchanged, which is the
+                whole point of starting from the released checkpoint.
+
+                Reported per key rather than silently skipped: if something OTHER than the
+                action encoder/decoder shows up here, the config is wrong and the run should
+                be stopped, not quietly started with randomly-initialised weights.
+                """
+                own = model.state_dict()
+                kept, dropped = {}, []
+                for k, v in state_dict.items():
+                    if k in own and own[k].shape != v.shape:
+                        dropped.append((k, tuple(v.shape), tuple(own[k].shape)))
+                    else:
+                        kept[k] = v
+                for k, ckpt_shape, model_shape in dropped:
+                    mprint(f"  [{where}] SHAPE MISMATCH, not loaded: {k} "
+                           f"checkpoint{list(ckpt_shape)} vs model{list(model_shape)} "
+                           f"-- this parameter stays randomly initialised")
+                return kept
+
             if os.path.exists(safetensors_index_path):
                 with open(safetensors_index_path, 'r') as f:
                     index = json.load(f)
@@ -716,11 +751,13 @@ class BaseExperiment(ABC):
                     shard_path = os.path.join(ckpt_dir, shard_file)
                     mprint(f"Loading shard: {shard_path}")
                     shard_state_dict = load_file(shard_path)
+                    shard_state_dict = _drop_shape_mismatches(shard_state_dict, model, shard_file)
                     model.load_state_dict(shard_state_dict, strict=False)
                     del shard_state_dict
                     gc.collect()
             elif os.path.exists(safetensors_path):
                 state_dict = load_file(safetensors_path)
+                state_dict = _drop_shape_mismatches(state_dict, model, "model.safetensors")
                 model.load_state_dict(state_dict, strict=False)
             else:
                 raise FileNotFoundError(
@@ -866,6 +903,28 @@ class BaseExperiment(ABC):
         return trainer
 
     def train(self):
+        # ZeRO-3 attaches per-submodule forward hooks for param gather/re-shard, which
+        # corrupts the VAE's stateful causal-conv feat_cache (encode() runs a
+        # temporal-chunked loop reusing the cache across CausalConv3d layers -> "tensor
+        # size mismatch" in wan_video_vae cat). Flag the VAE encoder/decoder as ZeRO-3 leaf
+        # modules so ZeRO-3 gathers each whole module atomically and skips intra-module
+        # hooks. Must run before deepspeed.initialize (i.e. before trainer.train).
+        # No-op for zero1/zero2 -- but REQUIRED for the full fine-tune recipe, which needs
+        # zero3 (see Psi0 baselines/dreamzero/g1_sonic_training_full.sh).
+        try:
+            from deepspeed.utils import set_z3_leaf_modules
+            from groot.vla.model.dreamzero.modules.wan_video_vae import (
+                Encoder3d, Encoder3d_38, Decoder3d, Decoder3d_38,
+            )
+            leaves = set_z3_leaf_modules(
+                self.trainer.model,
+                [Encoder3d, Encoder3d_38, Decoder3d, Decoder3d_38],
+                raise_if_not_found=False,
+            )
+            mprint(f"Flagged {len(leaves)} VAE encoder/decoder module(s) as zero3 leaf "
+                   f"(feat_cache fix; no-op for zero1/2)")
+        except Exception as e:  # noqa: BLE001
+            mprint(f"Warning: failed to set VAE z3 leaf modules: {e}")
         # Start training.
         self.trainer.train(resume_from_checkpoint=self.resume_from_checkpoint)
         self.trainer.save_state()

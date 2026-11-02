@@ -343,6 +343,205 @@ transform_yam:
 
 
 ################################################################################
+# unitree_g1_sonic  (Unitree G1 + SONIC whole-body controller, from soma)
+#
+#   video   1 camera  -- ego_view (head-mounted, 240x320 @ 50 fps)
+#   state  43 dims    -- observation.state[0:43] split into 7 joint groups; the
+#                        modality_keys order below reproduces that packed vector
+#                        exactly (left_leg 6, right_leg 6, waist 3, left_arm 7,
+#                        left_hand 7, right_arm 7, right_hand 7).
+#   action 78 dims    -- action.motion_token(64) + teleop.{left,right}_hand_joints(7+7).
+#                        motion_token is SONIC's LATENT command, not a joint target, so
+#                        this embodiment is deliberately NOT relative-action: there is no
+#                        state.motion_token to difference against (see
+#                        unitree_g1_sonic_relative.yaml, relative_action: false).
+#
+# Single camera => `_prepare_video` leaves the view untiled (the >1-view grid code never
+# runs), and the caption branch in transform/dreamzero_cotrain.py describes one view.
+################################################################################
+
+modality_config_unitree_g1_sonic:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      - video.ego_view
+  state:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - state.left_leg
+      - state.right_leg
+      - state.waist
+      - state.left_arm
+      - state.left_hand
+      - state.right_arm
+      - state.right_hand
+  action:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    modality_keys:
+      - action.motion_token
+      - action.left_hand_joints
+      - action.right_hand_joints
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.human.task_description
+
+transform_unitree_g1_sonic:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    # Video transforms
+    - <<: *totensor_cfg
+      apply_to: ${modality_config_unitree_g1_sonic.video.modality_keys}
+    - <<: *crop_cfg
+      apply_to: ${modality_config_unitree_g1_sonic.video.modality_keys}
+    - <<: *resize_cfg
+      apply_to: ${modality_config_unitree_g1_sonic.video.modality_keys}
+    - <<: *color_jitter_cfg
+      apply_to: ${modality_config_unitree_g1_sonic.video.modality_keys}
+    - <<: *to_numpy_cfg
+      apply_to: ${modality_config_unitree_g1_sonic.video.modality_keys}
+
+    # State transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_unitree_g1_sonic.state.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_unitree_g1_sonic.state.modality_keys}
+      normalization_modes:
+        state.left_leg: q99
+        state.right_leg: q99
+        state.waist: q99
+        state.left_arm: q99
+        state.left_hand: q99
+        state.right_arm: q99
+        state.right_hand: q99
+
+    # Action transforms
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_unitree_g1_sonic.action.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_unitree_g1_sonic.action.modality_keys}
+      normalization_modes:
+        action.motion_token: q99
+        action.left_hand_joints: q99
+        action.right_hand_joints: q99
+
+    # ConcatTransform -- the order here IS the 78-D action layout the policy server
+    # slices back apart (motion_token 0:64, left_hand 64:71, right_hand 71:78).
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_unitree_g1_sonic.video.modality_keys}
+      state_concat_order: ${modality_config_unitree_g1_sonic.state.modality_keys}
+      action_concat_order: ${modality_config_unitree_g1_sonic.action.modality_keys}
+
+    # Model-specific transform
+    - ${model_specific_transform}
+
+
+################################################################################
+# unitree_g1_amo  (Unitree G1 + AMO whole-body controller, from soma)
+#
+#   video   1 camera  -- ego_view (240x320 @ 50 fps)
+#   state  32 dims    -- observation.state, in THIS order (left_hand 7, right_hand 7,
+#                        left_arm 7, right_arm 7, rpy 3, height 1)
+#   action 36 dims    -- EXPLICIT: arms 7+7, torso rpy 3, height 1, locomotion command
+#                        (torso_vx, torso_vy, torso_vyaw, target_yaw) and hands 7+7.
+#                        Same shape as the published DreamZero G1 setting and SIMPLE's
+#                        DreamZero G1 baseline. Contrast unitree_g1_sonic, whose 64-D
+#                        latent motion_token the model failed to condition on at all.
+################################################################################
+
+modality_config_unitree_g1_amo:
+  video:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+    eval_delta_indices: [0]
+    modality_keys:
+      - video.ego_view
+  state:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - state.left_hand
+      - state.right_hand
+      - state.left_arm
+      - state.right_arm
+      - state.rpy
+      - state.height
+  action:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    modality_keys:
+      - action.left_arm
+      - action.right_arm
+      - action.rpy
+      - action.height
+      - action.torso_vx
+      - action.torso_vy
+      - action.torso_vyaw
+      - action.target_yaw
+      - action.left_hand_joints
+      - action.right_hand_joints
+  language:
+    _target_: groot.vla.data.dataset.ModalityConfig
+    delta_indices: [0]
+    modality_keys:
+      - annotation.human.task_description
+
+transform_unitree_g1_amo:
+  _target_: groot.vla.data.transform.ComposedModalityTransform
+  transforms:
+    - <<: *totensor_cfg
+      apply_to: ${modality_config_unitree_g1_amo.video.modality_keys}
+    - <<: *crop_cfg
+      apply_to: ${modality_config_unitree_g1_amo.video.modality_keys}
+    - <<: *resize_cfg
+      apply_to: ${modality_config_unitree_g1_amo.video.modality_keys}
+    - <<: *color_jitter_cfg
+      apply_to: ${modality_config_unitree_g1_amo.video.modality_keys}
+    - <<: *to_numpy_cfg
+      apply_to: ${modality_config_unitree_g1_amo.video.modality_keys}
+
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_unitree_g1_amo.state.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_unitree_g1_amo.state.modality_keys}
+      normalization_modes:
+        state.left_hand: q99
+        state.right_hand: q99
+        state.left_arm: q99
+        state.right_arm: q99
+        state.rpy: q99
+        state.height: q99
+
+    - _target_: groot.vla.data.transform.StateActionToTensor
+      apply_to: ${modality_config_unitree_g1_amo.action.modality_keys}
+    - _target_: groot.vla.data.transform.StateActionTransform
+      apply_to: ${modality_config_unitree_g1_amo.action.modality_keys}
+      normalization_modes:
+        action.left_arm: q99
+        action.right_arm: q99
+        action.rpy: q99
+        action.height: q99
+        action.torso_vx: q99
+        action.torso_vy: q99
+        action.torso_vyaw: q99
+        action.target_yaw: q99
+        action.left_hand_joints: q99
+        action.right_hand_joints: q99
+
+    - _target_: groot.vla.data.transform.ConcatTransform
+      video_concat_order: ${modality_config_unitree_g1_amo.video.modality_keys}
+      state_concat_order: ${modality_config_unitree_g1_amo.state.modality_keys}
+      action_concat_order: ${modality_config_unitree_g1_amo.action.modality_keys}
+
+    - ${model_specific_transform}
+
+
+################################################################################
 # Modality Configs
 ################################################################################
 
@@ -350,6 +549,8 @@ modality_configs:
   oxe_droid: ${modality_config_oxe_droid}
   agibot: ${modality_config_agibot}
   yam: ${modality_config_yam}
+  unitree_g1_sonic: ${modality_config_unitree_g1_sonic}
+  unitree_g1_amo: ${modality_config_unitree_g1_amo}
 
 ################################################################################
 # Transforms
@@ -359,6 +560,8 @@ transforms:
   oxe_droid: ${transform_oxe_droid}
   agibot: ${transform_agibot}
   yam: ${transform_yam}
+  unitree_g1_sonic: ${transform_unitree_g1_sonic}
+  unitree_g1_amo: ${transform_unitree_g1_amo}
 
 ################################################################################
 # Metadata Versions
@@ -368,6 +571,8 @@ metadata_versions:
   oxe_droid: '0221'
   agibot: '0221'
   yam: '0221'
+  unitree_g1_sonic: '0221'
+  unitree_g1_amo: '0221'
 
 ################################################################################
 # FPS (per embodiment, null means use dataset default)
@@ -375,3 +580,5 @@ metadata_versions:
 
 fps:
   yam: 30
+  unitree_g1_sonic: 50        # SONIC records at 50 Hz
+  unitree_g1_amo: 50

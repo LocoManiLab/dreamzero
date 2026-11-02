@@ -23,12 +23,37 @@ class ShardedLeRobotSingleDataset(LeRobotSingleDataset):
     def __init__(
         self,
         *args,
+        chunk_stride: int = 1,
+        action_chunk_len: int = 24,
         num_steps_per_shard: int = int(1e4),
         **kwargs,
     ):
         self.args = args
         self.kwargs = kwargs
         super().__init__(*args, **kwargs)
+        # How many RAW frames one sampled step spans. Upstream is 1: an action chunk is 24
+        # consecutive frames and its video is 8 frames at stride 3 over those same 24.
+        # Those constants encode a CADENCE IN SECONDS at the source fps (DROID 15 Hz ->
+        # 24 frames = 1.60 s of action, 33 frames = 6.40 s of video). Replayed on 50 Hz
+        # G1 SONIC data they become 0.48 s and 1.92 s -- 3.3x shorter than anything the
+        # pretrained checkpoint ever saw, with 60 ms between "consecutive" video frames.
+        # chunk_stride re-expands the window without changing the token count: stride 3 on
+        # 50 Hz data restores 1.44 s / 4.32 s at identical sequence length. The policy then
+        # emits actions at fps/stride, so the deploy side must upsample by the same factor.
+        self.chunk_stride = max(1, int(chunk_stride))
+        # Actions per chunk. MUST equal the model's `num_action_per_block`: the DiT's
+        # action register holds exactly this many action tokens per image block, with its
+        # own 1D RoPE positions, and the pretrained weights were fitted to that layout.
+        # Upstream hardcoded 24 here, but DreamZero-AgiBot -- the checkpoint we LoRA-adapt
+        # from -- was trained with 48 (its experiment_cfg/conf.yaml: action_horizon 48,
+        # num_action_per_block 48), and so is the published reproduction setting. Feeding
+        # 24 into a register built for 48 is silent: shapes still line up because the DiT
+        # derives the register length from num_action_per_block, so the model simply reads
+        # a layout it was never trained on.
+        # The per-chunk video stride follows from it as chunk_len // 8 -- 8 frames spread
+        # over one action horizon, the same formula SIMPLE's DreamZero G1 client uses
+        # (video_stride = action_horizon // 8).
+        self.action_chunk_len = max(8, int(action_chunk_len))
         self.num_steps_per_shard = num_steps_per_shard
         self.all_video_paths = self.get_all_video_paths()
         self.all_parquet_paths = self.get_all_parquet_paths()
@@ -326,12 +351,37 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
     def __init__(
         self,
         *args,
+        chunk_stride: int = 1,
+        action_chunk_len: int = 24,
         num_steps_per_shard: int = int(1e4),
         **kwargs,
     ):
         self.args = args
         self.kwargs = kwargs
         super().__init__(*args, **kwargs)
+        # How many RAW frames one sampled step spans. Upstream is 1: an action chunk is 24
+        # consecutive frames and its video is 8 frames at stride 3 over those same 24.
+        # Those constants encode a CADENCE IN SECONDS at the source fps (DROID 15 Hz ->
+        # 24 frames = 1.60 s of action, 33 frames = 6.40 s of video). Replayed on 50 Hz
+        # G1 SONIC data they become 0.48 s and 1.92 s -- 3.3x shorter than anything the
+        # pretrained checkpoint ever saw, with 60 ms between "consecutive" video frames.
+        # chunk_stride re-expands the window without changing the token count: stride 3 on
+        # 50 Hz data restores 1.44 s / 4.32 s at identical sequence length. The policy then
+        # emits actions at fps/stride, so the deploy side must upsample by the same factor.
+        self.chunk_stride = max(1, int(chunk_stride))
+        # Actions per chunk. MUST equal the model's `num_action_per_block`: the DiT's
+        # action register holds exactly this many action tokens per image block, with its
+        # own 1D RoPE positions, and the pretrained weights were fitted to that layout.
+        # Upstream hardcoded 24 here, but DreamZero-AgiBot -- the checkpoint we LoRA-adapt
+        # from -- was trained with 48 (its experiment_cfg/conf.yaml: action_horizon 48,
+        # num_action_per_block 48), and so is the published reproduction setting. Feeding
+        # 24 into a register built for 48 is silent: shapes still line up because the DiT
+        # derives the register length from num_action_per_block, so the model simply reads
+        # a layout it was never trained on.
+        # The per-chunk video stride follows from it as chunk_len // 8 -- 8 frames spread
+        # over one action horizon, the same formula SIMPLE's DreamZero G1 client uses
+        # (video_stride = action_horizon // 8).
+        self.action_chunk_len = max(8, int(action_chunk_len))
         self.num_steps_per_shard = num_steps_per_shard
         self.all_video_paths = self.get_all_video_paths()
         self.all_parquet_paths = self.get_all_parquet_paths()
@@ -817,7 +867,7 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                     break
                     
                 if not back_done:
-                    back_anchor = first_idx - 24 * step
+                    back_anchor = first_idx - self.action_chunk_len * self.chunk_stride * step
                     if back_anchor < 0:
                         back_done = True
                     elif language_annotations[back_anchor] != target_language:
@@ -827,7 +877,7 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                 if len(sampled_list) >= max_frames:
                     break
                 if not fwd_done:
-                    fwd_anchor = first_idx + 24 * step
+                    fwd_anchor = first_idx + self.action_chunk_len * self.chunk_stride * step
                     if fwd_anchor >= trajectory_length:
                         fwd_done = True
                     elif language_annotations[fwd_anchor] != target_language:
@@ -959,20 +1009,31 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                 target_num_chunks = self._current_num_chunks[first_idx]
                 # print(f"Using target_num_chunks from video: {target_num_chunks}")
             
-            max_frames = 24 * self.max_chunk_size
-            per_step_offsets = list(range(24))  # 0..23
+            st = self.chunk_stride
+            L = self.action_chunk_len
+            max_frames = L * self.max_chunk_size
+            per_step_offsets = list(range(0, L * st, st))  # L steps spanning L*stride frames
             sampled_list: list[int] = []
 
             def add_step_set(anchor_index: int) -> None:
                 nonlocal sampled_list
                 # Ensure the whole 32-length chunk fits within bounds
-                if anchor_index < 0 or anchor_index + 24 >= trajectory_length:
+                if anchor_index < 0 or anchor_index + L * st > trajectory_length:
+                    # SAME bound as the video sampler below -- they must agree or the two
+                    # modalities disagree on how many chunks this trajectory yields.
+                    # Upstream's two bounds differ by one frame (`+24 >=` for actions,
+                    # `+23 >=` for video), which is latent at horizon 24 (96 frames, longer
+                    # than almost every episode) and fires at 48 (192 frames): the video
+                    # sampler takes 4 chunks, the action sampler 3, and training dies with
+                    # `AssertionError: actions.shape [1,144,78] ... video.shape [1,3,33,...]`.
+                    # The largest index either sampler touches is anchor + (L-1)*st, so
+                    # `anchor + L*st <= trajectory_length` is correct for both.
                     return
                 # Ensure we don't overrun the max_frames cap with a partial chunk
-                if len(sampled_list) + 24 > max_frames:
+                if len(sampled_list) + L > max_frames:
                     return
                 # If we have a target number of chunks, stop when we reach it
-                if target_num_chunks is not None and len(sampled_list) // 24 >= target_num_chunks:
+                if target_num_chunks is not None and len(sampled_list) // L >= target_num_chunks:
                     return
                 for offset in per_step_offsets:
                     idx = anchor_index + offset
@@ -987,11 +1048,11 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             fwd_done = False
             while len(sampled_list) < max_frames and (not back_done or not fwd_done):
                 # Stop if we've reached the target number of chunks
-                if target_num_chunks is not None and len(sampled_list) // 24 >= target_num_chunks:
+                if target_num_chunks is not None and len(sampled_list) // L >= target_num_chunks:
                     break
                     
                 if not back_done:
-                    back_anchor = first_idx - 24 * step
+                    back_anchor = first_idx - self.action_chunk_len * self.chunk_stride * step
                     if back_anchor < 0:
                         back_done = True
                     elif language_annotations[back_anchor] != target_language:
@@ -1001,7 +1062,7 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                 if len(sampled_list) >= max_frames:
                     break
                 if not fwd_done:
-                    fwd_anchor = first_idx + 24 * step
+                    fwd_anchor = first_idx + self.action_chunk_len * self.chunk_stride * step
                     if fwd_anchor >= trajectory_length:
                         fwd_done = True
                     elif language_annotations[fwd_anchor] != target_language:
@@ -1014,7 +1075,7 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
                 unique_sorted = np.array(sorted(set(sampled_list)), dtype=int)
                 # Enforce divisibility by 30 and the 480 cap
                 capped_size = min(unique_sorted.size, max_frames)
-                divisible_size = (capped_size // 24) * 24
+                divisible_size = (capped_size // L) * L
                 sampled_indices = unique_sorted[:divisible_size]
             else:
                 sampled_indices = np.array([], dtype=int)
@@ -1157,15 +1218,18 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         # - keeping language consistent with target_language at the anchor step,
         # - and limiting the total collected frames to 81.
         max_frames = 8 * self.max_chunk_size + 1
-        per_step_offsets = [0, 3, 6, 9, 12, 15, 18, 21]
+        st = self.chunk_stride
+        L = self.action_chunk_len
+        # 8 frames spread over one action horizon -- SIMPLE's video_stride = horizon // 8.
+        per_step_offsets = [i * (L // 8) * st for i in range(8)]
         sampled_list: list[int] = []
         
         def add_step_set(anchor_index: int) -> None:
             # Only add a complete 4-frame set if it fully fits and capacity allows
             # Require full 32-frame window to exist for alignment with action/state
             nonlocal sampled_list
-            if anchor_index < 0 or anchor_index + 23 >= trajectory_length:
-                return
+            if anchor_index < 0 or anchor_index + L * st > trajectory_length:
+                return   # same bound as the action sampler; see the note there
             if len(sampled_list) + len(per_step_offsets) > max_frames:
                 return
             for offset in per_step_offsets:
@@ -1182,7 +1246,7 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         while len(sampled_list) < max_frames and (not back_done or not fwd_done):
             # Backward step
             if not back_done:
-                back_anchor = first_idx - 24 * step
+                back_anchor = first_idx - self.action_chunk_len * self.chunk_stride * step
                 if back_anchor < 0:
                     back_done = True
                 elif language_annotations[back_anchor] != target_language:
@@ -1193,7 +1257,7 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             if len(sampled_list) >= max_frames:
                 break
             if not fwd_done:
-                fwd_anchor = first_idx + 24 * step
+                fwd_anchor = first_idx + self.action_chunk_len * self.chunk_stride * step
                 if fwd_anchor >= trajectory_length:
                     fwd_done = True
                 elif language_annotations[fwd_anchor] != target_language:
